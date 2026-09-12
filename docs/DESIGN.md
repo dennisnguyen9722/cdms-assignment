@@ -17,38 +17,26 @@ and across failures of any component.
 ## 2. Architecture
 
 ```
-                   ┌──────────────────────────────┐
-  scheduled poll ──┤                              │
-  webhook       ───┤   raw_events (inbox queue)   │──┐
-  excel upload  ───┤                              │  │
-                   └──────────────────────────────┘  │
-                                                     ▼
-                                         ┌──────────────────────┐
-                                         │  worker (one tx per  │
-                                         │  event)              │
-                                         └──────────┬───────────┘
-                                                    │
-                             ┌──────────────────────┴─────────────────┐
-                             ▼                                        ▼
-                   products_current                         product_changes
-                   (latest state + hash)                    (append-only log)
+  scheduled poll ──┐
+  webhook       ───┼──▶  raw_events  ──▶  worker  ──┬──▶  products_current
+  excel upload  ───┘     (inbox)        (one tx)    └──▶  product_changes
 ```
 
-Three components run as containers on a single machine: `postgres`,
-`vietful-emulator`, `cdms`. The CDMS process hosts the collector (cron), the
-webhook controller and the worker.
+Three containers run on a single machine: `postgres`, `vietful-emulator`,
+`cdms`. The CDMS process hosts the collector (cron), the webhook controller, the
+Excel upload controller and the worker.
 
 ### 2.1 Why an inbox table instead of processing inline
 
 Every ingestion path does one thing only: write the raw payload to `raw_events`
 and return. Processing happens in a separate loop. This buys four things at once:
 
-- **Spike tolerance** — the webhook answers `202 Accepted` immediately and never
-  blocks on database contention, so the caller never times out.
+- **Spike tolerance** — webhook and upload answer `202 Accepted` immediately and
+  never block on database contention, so the caller never times out.
 - **Crash safety** — once the payload is in the inbox it survives a process
   restart; nothing is held only in memory.
 - **Uniformity** — poll, webhook and Excel converge on one code path. Adding the
-  webhook required zero changes to the worker.
+  second and third sources required **zero changes to the worker**.
 - **Backpressure** — the queue absorbs bursts; the worker drains at its own rate.
 
 ---
@@ -66,15 +54,26 @@ hash      = sha256(canonical)
 Comparing one hash replaces comparing every field individually, so no field can
 be silently missed when Vietful adds one.
 
-Two details that matter:
-
-- **Key ordering.** `{"a":1,"b":2}` and `{"b":2,"a":1}` are the same data but
-  hash differently. Keys are sorted before hashing.
-- **Volatile fields.** `updated_at` (and similar sync timestamps) are stripped
-  before hashing. Vietful refreshes them on read, so including them would mark
-  every product as changed on every poll and fill the change log with noise.
-
 `change_type` is `CREATED` when the product id is unseen, `UPDATED` otherwise.
+
+### 3.1 Key ordering
+
+`{"a":1,"b":2}` and `{"b":2,"a":1}` are the same data but hash differently. Keys
+are sorted before hashing.
+
+### 3.2 Volatile fields
+
+`updated_at` and similar sync timestamps are stripped before hashing. Vietful
+refreshes them on read, so including them would mark every product as changed on
+every poll and fill the change log with noise.
+
+### 3.3 Cross-source normalisation
+
+Excel parsing returns `price` as a string where the API returns a number.
+Hashing them directly would produce different fingerprints for identical
+products, so every source normalises field types before hashing. Without this,
+the same product arriving from two channels would register as a spurious change
+— which is the central problem when unifying heterogeneous sources.
 
 ---
 
@@ -99,11 +98,11 @@ The outer layer is an optimisation; the inner layer is the correctness
 guarantee. Even with a bug in application code, the database refuses to store a
 duplicate change.
 
-A worked example from testing: the same product posted twice to the webhook —
-once with an `x-delivery-id` header and once without — produces two distinct
-`raw_events` rows (different keys), but only one row in `product_changes`,
-because the second one is caught by the content-hash constraint. This is exactly
-why one layer is not enough.
+A worked example observed during testing: the same product posted twice to the
+webhook — once with an `x-delivery-id` header and once without — produces two
+distinct `raw_events` rows (different keys), but only one row in
+`product_changes`, because the second is caught by the content-hash constraint.
+This is exactly why one layer is not enough.
 
 ### 4.2 Idempotency key per source
 
@@ -111,7 +110,7 @@ why one layer is not enough.
 |---|---|---|
 | poll | `poll:sha256(batch payload)` | a timestamp key would always differ and be useless; hashing the batch means an unchanged catalogue produces no new work at all |
 | webhook | `webhook:<x-delivery-id>`, falling back to `webhook:sha256(payload)` | real webhook senders retry with the same delivery id when they miss the response |
-| excel | `excel:sha256(file bytes)` — *not implemented* | re-uploading the same file is the common operator mistake |
+| excel | `excel:sha256(file bytes)` | re-uploading the same file is the most common operator mistake |
 
 ### 4.3 Transaction boundary
 
@@ -142,27 +141,32 @@ scales to multiple workers without changes.
 | Vietful returns 5xx | poll fails and logs; the next scheduled run recovers; no partial batch is enqueued because the batch is assembled before insert |
 | Overlapping cron runs | the collector holds a `running` flag and skips a tick if the previous one is still in flight |
 | Duplicate webhook delivery | rejected by the idempotency key, returns `duplicate_ignored` |
+| Duplicate Excel upload | rejected by file hash, returns `duplicate_ignored` |
 
-### Measured results
+### 5.1 Measured results
 
-All three scenarios are reproducible from `scripts/`; captured output is in `docs/`.
+All three scenarios are reproducible from `scripts/`; captured output is in
+`docs/`.
 
 **CDMS killed mid-transaction** (`test-crash-recovery.sh`)
+
 8000 products submitted via webhook, the process stopped 2 seconds into
 processing. At the moment of the kill: 1 event still `pending`, **0 rows**
 written for that batch despite partial work — the transaction rolled back
 cleanly. After restart: **8000 rows, 0 duplicates**.
 
 **Postgres stopped for 45 seconds** (`test-db-failure.sh`)
-CDMS stayed up (`Up About a minute` while Postgres was down). The worker logged
-a connection error every 2 seconds and resumed normal processing once the
-database returned, with no manual intervention.
+
+CDMS stayed up throughout. The worker logged a connection error every 2 seconds
+and resumed normal processing once the database returned, with no manual
+intervention.
 
 Note: in a Docker network a stopped container also disappears from DNS, so the
 failure surfaces as `getaddrinfo ENOTFOUND postgres` rather than a refused
 connection.
 
 **Vietful returning 500 for 90 seconds** (`test-vietful-failure.sh`)
+
 `product_changes` held steady at 500 rows throughout the outage — nothing lost,
 nothing garbage-written. After recovery, 5 mutated products produced exactly 5
 new change rows.
@@ -177,45 +181,78 @@ new change rows.
 - `products_current` — one row per product; the hash baseline for comparison.
 - `product_changes` — append-only change log; the actual deliverable of the
   service.
-- `ingestion_cursor` — per-source watermark (created, not yet used; the
-  content-hash batch key made a time cursor unnecessary for polling).
+- `ingestion_cursor` — per-source watermark (created, not used; the content-hash
+  batch key made a time cursor unnecessary for polling).
 
 ---
 
 ## 7. Scope: done vs not done
 
 ### Implemented
+
 - Vietful emulator with faker-generated products, pagination, and control
   endpoints for mutating data and injecting failures
 - Scheduled polling with overlap protection and batch-level deduplication
 - Webhook ingestion with delivery-id idempotency, responding `202`
+- Excel upload with file-hash idempotency and cross-source type normalisation
 - Worker with content-hash change detection and single-transaction processing
-- Two-layer deduplication as described above
-- Postgres schema with the constraints that enforce correctness
+- Two-layer deduplication as described in §4.1
+- Failure-injection scripts with recorded results for all three failure modes
+- Containerised deployment; `docker compose up` brings up the whole system
 
 ### Not implemented
-- **Excel upload.** The ingestion path is the same shape as the webhook: parse
-  rows, write one `raw_events` row keyed on the file hash. The worker would not
-  change. Dropped for time.
+
 - **Deletion detection.** Polling only reveals what exists; a product removed
-  upstream is invisible. Catching deletes requires comparing the full id set per
-  poll, which conflicts with the incremental design. Noted as a known limitation.
+  upstream is invisible. `products_current` therefore drifts upward relative to
+  the source — observed directly in testing, where it held 503 rows against an
+  emulator serving 500. Catching deletes requires comparing the full id set per
+  poll, which conflicts with the incremental design.
 - **Ordering guarantees for out-of-order webhooks.** If an older webhook arrives
   after a newer one, the older payload wins. A monotonic version field from
   Vietful would fix this.
-- **Retry/dead-letter policy.** `attempts` and `last_error` exist but no backoff
-  or DLQ is wired up.
-- TODO: spike/concurrency test results
+- **Retry backoff and dead-letter queue.** `attempts` and `last_error` columns
+  exist but no backoff policy or DLQ is wired up; a permanently malformed event
+  would be retried indefinitely.
+- **Dedicated spike/concurrency test.** No purpose-built load test was run.
+  Throughput was measured incidentally during crash testing: 8000 records
+  ingested and processed in roughly 4 seconds (~2000 rows/sec) on a laptop.
+- **Revert semantics.** A product that changes and then reverts to an earlier
+  value produces a hash identical to an existing row, so the revert is not
+  recorded. Correct for "store only new data"; wrong if a full price history is
+  needed. Adding a timestamp to the uniqueness key would change this trade-off.
 
 ---
 
 ## 8. Lessons learned
 
-TODO — write after Monday's failure testing. Candidates:
-- why a timestamp is the wrong idempotency key and a content hash is the right one
-- why volatile fields must be excluded before hashing
-- what `SKIP LOCKED` buys over naive `SELECT ... LIMIT 1`
-- the difference between exactly-once delivery and exactly-once effect
+Each of these came from deliberately breaking the running system rather than
+from reading about it.
+
+**`pg.Pool` emits `error` on idle clients when Postgres closes connections.**
+Without a listener, Node treats it as an unhandled error and kills the process —
+so a database outage took the whole service down, precisely the failure the
+assignment asks the system to survive. One `pool.on('error', ...)` handler fixed
+it. An earlier draft of §5 claimed the service retried through database outages;
+running the test showed that claim was false.
+
+**Express caps request bodies at 100KB by default.** An 8000-product webhook
+payload is about 1MB and was rejected outright. Realistic webhook volumes need
+the limit raised explicitly.
+
+**`restart: unless-stopped` invalidates failure measurements.** Docker restarted
+the container before the test could read the intermediate state, so the crash
+test reported data that appeared to survive a rollback. Good for operations,
+misleading for testing — `docker compose stop` is needed instead of `kill`.
+
+**A fixed `faker.seed()` makes "random" data repeat across restarts.** Mutations
+regenerated identical values, which produced identical hashes, which the
+deduplication layer correctly rejected — leaving a mutation test that appeared to
+do nothing. The deduplication was working; the test was wrong.
+
+**Choosing the idempotency key is the actual design work.** Everything else
+follows from it. A timestamp key would have made the poll path useless; hashing
+the batch turned deduplication into a no-op on the common path where nothing
+changed.
 
 ---
 
