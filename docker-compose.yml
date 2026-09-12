@@ -19,5 +19,17 @@ services:
     build: ./apps/vietful-emulator
     ports:
       - "3001:3001"
+  cdms:
+    build: ./apps/cdms
+    environment:
+      DATABASE_URL: postgresql://cdms:cdms@postgres:5432/cdms
+      VIETFUL_URL: http://vietful:3001
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      vietful:
+        condition: service_started
 volumes:
   pgdata:
