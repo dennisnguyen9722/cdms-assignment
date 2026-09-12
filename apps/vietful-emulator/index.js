@@ -37,13 +37,16 @@ app.get('/products', (req, res) => {
   const start = (page - 1) * limit;
   res.json({
     data: products.slice(start, start + limit),
-    meta: { page, limit, total: products.length,
-            total_pages: Math.ceil(products.length / limit) },
+    meta: {
+      page, limit, total: products.length,
+      total_pages: Math.ceil(products.length / limit)
+    },
   });
 });
 
 // đổi ngẫu nhiên N sản phẩm -> dùng để demo change detection
 app.post('/_mutate', (req, res) => {
+  faker.seed();
   const count = parseInt(req.query.count) || 5;
   const changed = [];
   for (let i = 0; i < count; i++) {
@@ -58,6 +61,7 @@ app.post('/_mutate', (req, res) => {
 
 // thêm sản phẩm mới -> demo loại CREATED
 app.post('/_add', (req, res) => {
+  faker.seed();
   const count = parseInt(req.query.count) || 1;
   const added = [];
   for (let i = 0; i < count; i++) {
