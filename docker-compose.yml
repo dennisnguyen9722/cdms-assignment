@@ -11,10 +11,13 @@ services:
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U cdms"]
+      test: [ "CMD-SHELL", "pg_isready -U cdms" ]
       interval: 5s
       timeout: 3s
       retries: 5
-
+  vietful:
+    build: ./apps/vietful-emulator
+    ports:
+      - "3001:3001"
 volumes:
   pgdata:
