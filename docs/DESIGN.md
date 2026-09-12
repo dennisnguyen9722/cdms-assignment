@@ -138,13 +138,34 @@ scales to multiple workers without changes.
 | Failure | Behaviour |
 |---|---|
 | CDMS process killed mid-processing | transaction rolls back, event stays `pending`, reprocessed on restart, no duplicates |
-| Postgres down | ingestion and worker throw and retry on the next tick; poll data is refetched |
+| Postgres down | pool errors are caught, the process survives, worker and collector retry each tick until the database returns |
 | Vietful returns 5xx | poll fails and logs; the next scheduled run recovers; no partial batch is enqueued because the batch is assembled before insert |
 | Overlapping cron runs | the collector holds a `running` flag and skips a tick if the previous one is still in flight |
 | Duplicate webhook delivery | rejected by the idempotency key, returns `duplicate_ignored` |
 
-TODO: attach measured before/after row counts for each scenario, produced by
-`scripts/`.
+### Measured results
+
+All three scenarios are reproducible from `scripts/`; captured output is in `docs/`.
+
+**CDMS killed mid-transaction** (`test-crash-recovery.sh`)
+8000 products submitted via webhook, the process stopped 2 seconds into
+processing. At the moment of the kill: 1 event still `pending`, **0 rows**
+written for that batch despite partial work — the transaction rolled back
+cleanly. After restart: **8000 rows, 0 duplicates**.
+
+**Postgres stopped for 45 seconds** (`test-db-failure.sh`)
+CDMS stayed up (`Up About a minute` while Postgres was down). The worker logged
+a connection error every 2 seconds and resumed normal processing once the
+database returned, with no manual intervention.
+
+Note: in a Docker network a stopped container also disappears from DNS, so the
+failure surfaces as `getaddrinfo ENOTFOUND postgres` rather than a refused
+connection.
+
+**Vietful returning 500 for 90 seconds** (`test-vietful-failure.sh`)
+`product_changes` held steady at 500 rows throughout the outage — nothing lost,
+nothing garbage-written. After recovery, 5 mutated products produced exactly 5
+new change rows.
 
 ---
 
